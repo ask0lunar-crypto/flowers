@@ -62,6 +62,11 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers(); self.wfile.write(b)
     def do_GET(self):
         p=urlparse(self.path); u=user(self)
+        if parse_qs(p.query).get('action',[''])[0]=='logout':
+            for part in self.headers.get('Cookie','').split(';'):
+                if part.strip().startswith('sid='):
+                    SESSIONS.pop(part.strip().split('=',1)[1],None)
+            self.send('<!doctype html><html><head><meta http-equiv="refresh" content="0;url=/?page=login"></head><body>Выход выполнен.</body></html>',cookie='sid=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax');return
         if p.path == '/api/products':
             c=db(); rows=c.execute('SELECT id,name,category,description,price,image_url,is_active FROM products WHERE is_active=1 ORDER BY id').fetchall(); c.close()
             self.send(json.dumps([dict(r) for r in rows], ensure_ascii=False), ctype='application/json; charset=utf-8'); return
@@ -86,7 +91,34 @@ class Handler(BaseHTTPRequestHandler):
         else:body='<section class="empty"><h1>Flowers Studio</h1><p>Доставка по Москве и области ежедневно с 9:00 до 21:00.</p></section>'
         self.send(shell(n,body,u)); c.close()
     def do_POST(self):
-        q=urlparse(self.path); d={k:v[0] for k,v in parse_qs(self.rfile.read(int(self.headers.get('Content-Length',0))).decode()).items()}; c=db(); a=parse_qs(q.query).get('action',[''])[0]
+        q=urlparse(self.path); raw=self.rfile.read(int(self.headers.get('Content-Length',0))); c=db(); a=parse_qs(q.query).get('action',[''])[0]
+        if q.path=='/api/orders':
+            u=user(self)
+            if not u:
+                self.send(json.dumps({'error':'Требуется вход'},ensure_ascii=False),401,'application/json; charset=utf-8');c.close();return
+            try:
+                payload=json.loads(raw.decode('utf-8'))
+                address=str(payload.get('delivery_address','')).strip()
+                date=str(payload.get('delivery_date','')).strip()
+                items=payload.get('items',[])
+                if not address or not date or not isinstance(items,list) or not items:
+                    raise ValueError('Укажите адрес, дату и товары')
+                checked=[];total=0
+                for item in items:
+                    product=c.execute('SELECT id,price FROM products WHERE id=? AND is_active=1',(int(item['id']),)).fetchone()
+                    qty=int(item['qty'])
+                    if not product or qty<1 or qty>100:raise ValueError('Некорректный товар или количество')
+                    checked.append((product['id'],qty,product['price']))
+                    total+=qty*product['price']
+                cur=c.execute('INSERT INTO orders(user_id,total,delivery_address,delivery_date) VALUES(?,?,?,?)',(u['id'],total,address,date))
+                c.executemany('INSERT INTO order_items(order_id,product_id,quantity,price) VALUES(?,?,?,?)',[(cur.lastrowid,pid,qty,price) for pid,qty,price in checked])
+                c.commit()
+                self.send(json.dumps({'order_id':cur.lastrowid,'total':total},ensure_ascii=False),201,'application/json; charset=utf-8')
+            except (ValueError,TypeError,KeyError,IndexError,json.JSONDecodeError) as exc:
+                c.rollback();self.send(json.dumps({'error':str(exc)},ensure_ascii=False),400,'application/json; charset=utf-8')
+            finally:c.close()
+            return
+        d={k:v[0] for k,v in parse_qs(raw.decode()).items()}
         if a=='crud' and user(self) and user(self)['role']=='admin':
             t=d.get('table'); ident=d.get('id'); mode=d.get('crud')
             if t in CRUD_TABLES:
@@ -99,7 +131,9 @@ class Handler(BaseHTTPRequestHandler):
                 c.commit(); self.send('<meta http-equiv="refresh" content="0;url=/?page=admin">Сохранено'); return
         if a in ('login','register'):
             email=d.get('email','').strip().lower(); row=c.execute('SELECT * FROM users WHERE email=?',(email,)).fetchone()
+            if a=='register' and row:
+                self.send(shell('Регистрация','<section class="empty"><h1>Этот email уже зарегистрирован</h1><a class="button" href="/?page=login">Войти</a></section>',None),409);c.close();return
             if a=='register' and not row:c.execute('INSERT INTO users(name,email,password_hash) VALUES(?,?,?)',(d.get('name','Гость'),email,pwd(d.get('password',''))));c.commit();row=c.execute('SELECT * FROM users WHERE email=?',(email,)).fetchone()
-            if row and row['password_hash']==pwd(d.get('password','')):sid=secrets.token_urlsafe(24);SESSIONS[sid]=dict(row);self.send('<!doctype html><html><head><meta http-equiv="refresh" content="0;url=/?page=account"></head><body>Выполняется вход…</body></html>',cookie=f'sid={sid}; Path=/; HttpOnly; SameSite=Lax');return
+            if row and row['password_hash']==pwd(d.get('password','')):sid=secrets.token_urlsafe(24);SESSIONS[sid]=dict(row);self.send('<!doctype html><html><head><meta http-equiv="refresh" content="0;url=/?page=account"></head><body>Выполняется вход…</body></html>',cookie=f'sid={sid}; Path=/; HttpOnly; SameSite=Lax');c.close();return
         self.send(shell('Ошибка','<section class="empty"><h1>Не удалось выполнить действие</h1><a class="button" href="/?page=login">Вернуться</a></section>',None),400);c.close()
 if __name__=='__main__':init_db();print('Flowers app: http://127.0.0.1:8765');ThreadingHTTPServer(('127.0.0.1',8765),Handler).serve_forever()
